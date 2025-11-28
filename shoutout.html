@@ -1,0 +1,194 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Shoutout Overlay</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    :root{ --card-w:480px; --card-h:120px }
+    body{margin:0;background:transparent;font-family:system-ui,Segoe UI,Roboto,Arial}
+    .wrap{position:fixed;right:24px;bottom:24px;width:var(--card-w);height:var(--card-h);pointer-events:none}
+    .card{width:100%;height:100%;background:linear-gradient(90deg, rgba(10,11,33,0.95), rgba(6,7,20,0.9));border-radius:12px;padding:12px;display:flex;gap:12px;align-items:center;box-shadow:0 10px 40px rgba(2,6,23,0.7);transform:translateY(30px) scale(.98);opacity:0;transition:all 400ms cubic-bezier(.2,.9,.2,1); pointer-events:auto}
+    .card.show{transform:translateY(0) scale(1);opacity:1}
+    .avatar{width:96px;height:96px;border-radius:8px;flex:0 0 96px;background:#002}
+    .meta{flex:1;display:flex;flex-direction:column;justify-content:center}
+    .name{font-weight:700;font-size:20px}
+    .login{font-size:13px;color:#9fb0d3;margin-top:6px}
+    video{position:absolute;left:0;top:-240px;width:560px; height:auto; display:none; border-radius:6px; box-shadow:0 8px 40px rgba(0,0,0,.6)}
+    .small{font-size:12px;color:#98aecd}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div id="card" class="card">
+      <img id="avatar" class="avatar" src="" alt="avatar">
+      <div class="meta">
+        <div id="displayName" class="name"></div>
+        <div id="login" class="login"></div>
+        <div class="small" id="msg">Listening for <code>!so</code> / <code>!shoutout</code></div>
+      </div>
+    </div>
+  </div>
+
+  <video id="clipPlayer" controls playsinline></video>
+
+<script>
+/*
+  shoutout.html
+  Expected URL:
+    shoutout.html?channel=CHANNELNAME#token=ACCESS_TOKEN
+
+  It reads:
+   - channel from query param
+   - token from fragment '#token=...'
+  Then:
+   - Connects to Twitch IRC over WebSocket using that token and username
+   - Listens for PRIVMSG with '!so' or '!shoutout' followed by a username
+   - Fetches up to 20 clips from the target channel via Helix using token + client id
+   - Plays a random clip in the page (animated card shows)
+*/
+
+const CLIENT_ID = "YOUR_TWITCH_CLIENT_ID"; // <-- same client id as index.html
+const params = new URLSearchParams(window.location.search);
+const CHANNEL = params.get('channel') || '';
+const frag = location.hash.substring(1);
+const fragParams = new URLSearchParams(frag);
+const TOKEN = fragParams.get('token');
+
+if (!CHANNEL || !TOKEN) {
+  document.getElementById('msg').textContent = 'Missing channel or token. Use the dashboard to generate a URL.';
+  throw new Error('Missing channel or token');
+}
+
+const card = document.getElementById('card');
+const avatar = document.getElementById('avatar');
+const displayNameEl = document.getElementById('displayName');
+const loginEl = document.getElementById('login');
+const clipPlayer = document.getElementById('clipPlayer');
+
+async function fetchStreamerInfo() {
+  const r = await fetch(`https://api.twitch.tv/helix/users?login=${CHANNEL}`, {
+    headers: { 'Client-Id': CLIENT_ID, 'Authorization': 'Bearer ' + TOKEN }
+  }).then(r=>r.json());
+  if (r.data && r.data[0]) {
+    const d = r.data[0];
+    displayNameEl.textContent = d.display_name || d.login;
+    loginEl.textContent = '@' + d.login;
+    avatar.src = d.profile_image_url;
+  }
+}
+fetchStreamerInfo();
+
+// Connect to IRC (WebSocket)
+const ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+
+ws.onopen = () => {
+  // PASS is the oauth token, NICK is the streamer login
+  ws.send('PASS oauth:' + TOKEN);
+  ws.send('NICK ' + CHANNEL);
+  ws.send('JOIN #' + CHANNEL);
+  console.log('Connected to twitch chat as', CHANNEL);
+};
+
+ws.onmessage = async (evt) => {
+  const raw = evt.data.toString();
+  // console.log(raw);
+  if (!raw.includes('PRIVMSG')) return;
+
+  // Parse username and message
+  const match = raw.match(/:([^!]+)!.*PRIVMSG #[^ ]+ :(.+)/);
+  if (!match) return;
+  const sender = match[1];
+  const message = match[2].trim();
+
+  // Only respond to chat messages
+  if (message.startsWith('!so ') || message.startsWith('!shoutout ')) {
+    // Extract target username
+    const parts = message.split(/\s+/);
+    const target = parts[1] ? parts[1].replace(/^@/,'').replace(/[^a-z0-9_]/gi,'').toLowerCase() : null;
+    if (!target) return;
+    console.log('Shoutout requested for', target, 'by', sender);
+    showCard(`Shoutout: ${target}`);
+    playRandomClip(target);
+  }
+};
+
+// UI show/hide
+let cardTimeout;
+function showCard(msg) {
+  document.getElementById('msg').textContent = msg;
+  card.classList.add('show');
+  clearTimeout(cardTimeout);
+  cardTimeout = setTimeout(()=>{ card.classList.remove('show'); }, 18000);
+}
+
+// Fetch random clip and play
+async function playRandomClip(username) {
+  // get user id
+  const userResp = await fetch(`https://api.twitch.tv/helix/users?login=${username}`, {
+    headers: {'Client-Id': CLIENT_ID, 'Authorization':'Bearer ' + TOKEN}
+  }).then(r => r.json());
+  if (!userResp.data || userResp.data.length===0) {
+    console.warn('No user for', username);
+    return;
+  }
+  const uid = userResp.data[0].id;
+
+  // fetch clips (broadcaster_id)
+  const clipsResp = await fetch(`https://api.twitch.tv/helix/clips?broadcaster_id=${uid}&first=20`, {
+    headers: {'Client-Id': CLIENT_ID, 'Authorization':'Bearer ' + TOKEN}
+  }).then(r => r.json());
+
+  if (!clipsResp.data || clipsResp.data.length===0) {
+    console.warn('No clips for', username);
+    return;
+  }
+
+  const random = clipsResp.data[Math.floor(Math.random()*clipsResp.data.length)];
+  // Each clip object has 'embed_url' which must contain parent param with current origin
+  // Build the embed URL:
+  const parent = window.location.hostname;
+  // embed_url sometimes already has parameters, so append parent appropriately
+  let embed = random.embed_url || random.url;
+  if (embed.indexOf('parent=') === -1) {
+    if (embed.indexOf('?') === -1) embed += '?parent=' + parent;
+    else embed += '&parent=' + parent;
+  }
+
+  // Use clip embed url as src for video tag if possible — however embed_url is an <iframe>.
+  // We'll create an iframe overlay for the clip.
+  showClipIframe(random, parent);
+}
+
+function showClipIframe(clipObj, parent) {
+  // Remove previous iframe if present
+  const prev = document.getElementById('clip_iframe');
+  if (prev) prev.remove();
+
+  const iframe = document.createElement('iframe');
+  iframe.id = 'clip_iframe';
+  iframe.width = 560;
+  iframe.height = 315;
+  iframe.allow = 'autoplay; fullscreen';
+  iframe.style.position = 'absolute';
+  iframe.style.left = 'calc(50% - 280px)';
+  iframe.style.top = '-240px';
+  iframe.style.border = 'none';
+  iframe.style.zIndex = '9999';
+
+  let src = clipObj.embed_url || clipObj.url;
+  if (src.indexOf('parent=') === -1) {
+    if (src.indexOf('?') === -1) src += '?parent=' + parent;
+    else src += '&parent=' + parent;
+  }
+
+  iframe.src = src + '&autoplay=true';
+  document.body.appendChild(iframe);
+
+  // show card
+  card.classList.add('show');
+  setTimeout(()=>{ if (iframe) iframe.remove(); card.classList.remove('show'); }, 18000);
+}
+</script>
+</body>
+</html>
