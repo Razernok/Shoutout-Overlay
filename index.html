@@ -1,0 +1,209 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Shoutout Overlay — Login</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    body { font-family: system-ui,Segoe UI,Roboto,Arial; display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f172a;color:#e6eef8; }
+    .card{background:#071032;padding:28px;border-radius:10px;max-width:760px;width:100%;box-shadow:0 6px 24px rgba(0,0,0,.6)}
+    h1{margin:0 0 10px;font-size:20px}
+    p{margin:6px 0 14px;color:#c9d6e6}
+    input{width:100%;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,.06);background:#020617;color:#fff}
+    button{padding:10px 14px;border-radius:8px;border:none;background:#4f46e5;color:white;cursor:pointer;margin-right:8px}
+    .inline{display:flex;gap:8px;align-items:center}
+    .small{font-size:13px;color:#9fb0d3}
+    .success{background:#0b3a1f;padding:10px;border-radius:8px;color:#bff0c9}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Shoutout Overlay — Streamer login</h1>
+    <p>Log in with Twitch to generate a custom shoutout URL you can paste into OBS (keep it private).</p>
+
+    <div>
+      <label class="small">GitHub Pages base URL (where this is hosted):</label>
+      <input id="BASE_URL" placeholder="https://yourname.github.io/yourrepo" />
+    </div>
+
+    <div style="height:10px"></div>
+
+    <div class="inline">
+      <button id="loginBtn">Login with Twitch</button>
+      <button id="generateBtn" style="background:#0ea5a4">Generate URL</button>
+      <button id="revokeBtn" style="background:#ef4444">Revoke Token</button>
+    </div>
+
+    <div style="height:12px"></div>
+    <div id="status" class="small">Status: Not logged in.</div>
+
+    <div style="height:14px"></div>
+    <div id="result"></div>
+
+    <hr style="margin:14px 0;border:none;border-top:1px solid rgba(255,255,255,.04)">
+
+    <div class="small">
+      Instructions:
+      <ol>
+        <li>Set <b>BASE_URL</b> to your GitHub Pages URL (exact redirect URI you set in Twitch dev console).</li>
+        <li>Click <b>Login with Twitch</b>. Approve <code>chat:read</code>.</li>
+        <li>Click <b>Generate URL</b> — copy the URL and add it as an OBS Browser Source.</li>
+      </ol>
+    </div>
+  </div>
+
+<script>
+/*
+  Client-side PKCE auth flow for Twitch + simple dashboard.
+  Replace CLIENT_ID with your Twitch app's client id.
+*/
+const CLIENT_ID = "YOUR_TWITCH_CLIENT_ID"; // <-- REPLACE BEFORE DEPLOY
+const SCOPES = "chat:read"; // chat:read so overlay can read chat events (shoutout command)
+const loginBtn = document.getElementById('loginBtn');
+const generateBtn = document.getElementById('generateBtn');
+const revokeBtn = document.getElementById('revokeBtn');
+const status = document.getElementById('status');
+const result = document.getElementById('result');
+const baseInput = document.getElementById('BASE_URL');
+
+function randStr(len=64){
+  const arr = new Uint8Array(len/2);
+  window.crypto.getRandomValues(arr);
+  return Array.from(arr).map(b => ('0'+b.toString(16)).slice(-2)).join('');
+}
+
+// PKCE helpers
+async function sha256(buffer) {
+  const msgUint8 = new TextEncoder().encode(buffer);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+  return new Uint8Array(hashBuffer);
+}
+function base64url(buffer) {
+  return btoa(String.fromCharCode(...buffer)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+
+async function createCodeChallenge(verifier) {
+  const hashed = await sha256(verifier);
+  return base64url(hashed);
+}
+
+function setStatus(s){ status.textContent = 'Status: ' + s; }
+
+// OAuth start
+loginBtn.onclick = async () => {
+  const base = (baseInput.value || '').replace(/\/$/,'');
+  if (!base) { alert('Set your GitHub Pages base URL in the input first.'); return; }
+  const redirect_uri = base + '/index.html';
+
+  const verifier = randStr(128);
+  sessionStorage.setItem('pkce_verifier', verifier);
+  const challenge = await createCodeChallenge(verifier);
+
+  const state = randStr(32);
+  sessionStorage.setItem('pkce_state', state);
+  sessionStorage.setItem('redirect_uri', redirect_uri);
+
+  const url = `https://id.twitch.tv/oauth2/authorize?response_type=code&client_id=${encodeURIComponent(CLIENT_ID)}&redirect_uri=${encodeURIComponent(redirect_uri)}&scope=${encodeURIComponent(SCOPES)}&state=${state}&code_challenge=${challenge}&code_challenge_method=S256`;
+  window.location.href = url;
+};
+
+// On return from Twitch (index.html?code=...&state=...), exchange code for token USING PKCE
+async function tryHandleRedirect() {
+  const q = new URLSearchParams(window.location.search);
+  const code = q.get('code');
+  const state = q.get('state');
+  if (!code) return;
+
+  const savedState = sessionStorage.getItem('pkce_state');
+  if (state !== savedState) { setStatus('State mismatch'); return; }
+  setStatus('Exchanging code for token...');
+
+  const verifier = sessionStorage.getItem('pkce_verifier');
+  const redirect_uri = sessionStorage.getItem('redirect_uri');
+
+  // Exchange code for token via Twitch token endpoint
+  const body = new URLSearchParams({
+    client_id: CLIENT_ID,
+    grant_type: 'authorization_code',
+    code: code,
+    redirect_uri: redirect_uri,
+    code_verifier: verifier
+  });
+
+  // Twitch requires POST to https://id.twitch.tv/oauth2/token
+  const resp = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', body });
+  const data = await resp.json();
+  if (!data.access_token) {
+    setStatus('Token exchange failed: ' + (data.message || JSON.stringify(data)));
+    return;
+  }
+  // store token info in localStorage
+  localStorage.setItem('so_access_token', data.access_token);
+  localStorage.setItem('so_token_type', data.token_type || 'bearer');
+  localStorage.setItem('so_scope', (data.scope || []).join(' '));
+  setStatus('Logged in — token saved locally.');
+
+  // fetch streamer username
+  const u = await fetch('https://api.twitch.tv/helix/users', {
+    headers: { 'Authorization': 'Bearer ' + data.access_token, 'Client-Id': CLIENT_ID }
+  }).then(r => r.json());
+  if (u.data && u.data[0]) {
+    localStorage.setItem('so_username', u.data[0].login);
+    localStorage.setItem('so_display_name', u.data[0].display_name);
+    setStatus('Logged in as ' + u.data[0].login);
+  }
+
+  // clean URL (remove code params)
+  history.replaceState({}, document.title, window.location.pathname);
+  updateUI();
+}
+
+function updateUI(){
+  const token = localStorage.getItem('so_access_token');
+  const username = localStorage.getItem('so_username') || '';
+  if (token) {
+    setStatus('Logged in as ' + (username || 'unknown'));
+    result.innerHTML = `<div class="success">Logged in as <b>${username || 'unknown'}</b></div>`;
+  } else {
+    setStatus('Not logged in.');
+    result.innerHTML = '';
+  }
+}
+
+generateBtn.onclick = () => {
+  const token = localStorage.getItem('so_access_token');
+  const username = localStorage.getItem('so_username');
+  const base = (baseInput.value || '').replace(/\/$/,'');
+  if (!token) return alert('You must login first.');
+  if (!base) return alert('Set your GitHub Pages base URL input to your site URL.');
+
+  // Build a shareable URL: shoutout.html?channel=<username>#token=<ACCESS_TOKEN>
+  // We put the token in the fragment (#) so it is not sent to servers.
+  const url = `${base}/shoutout.html?channel=${encodeURIComponent(username)}#token=${encodeURIComponent(token)}`;
+  result.innerHTML = `<div><label class="small">Shareable shoutout URL (keep private):</label><input id="shareurl" value="${url}" readonly /></div>
+  <div style="height:8px"></div>
+  <div><button onclick="copyShare()">Copy URL</button> — Use this in OBS Browser Source (paste as URL)</div>
+  `;
+};
+
+revokeBtn.onclick = () => {
+  localStorage.removeItem('so_access_token');
+  localStorage.removeItem('so_username');
+  localStorage.removeItem('so_display_name');
+  localStorage.removeItem('so_scope');
+  setStatus('Token removed from local storage.');
+  result.innerHTML = '';
+};
+
+window.copyShare = () => {
+  const input = document.getElementById('shareurl');
+  input.select();
+  document.execCommand('copy');
+  alert('Copied!');
+};
+
+tryHandleRedirect();
+updateUI();
+</script>
+</body>
+</html>
